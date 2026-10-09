@@ -21,7 +21,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use atuin_client::ai_session::{HarnessKind, HarnessSession, SourceId};
-use atuin_client::settings::AiSessionFilterMode as FilterMode;
 use atuin_common::harnesstools::continuation::{self, Flattened};
 use tokio::sync::mpsc;
 
@@ -29,16 +28,17 @@ use super::catchup::{self, CatchUp};
 use super::resumer::{
     Continued, Forked, NotResumable, Restore, Resume, ResumePlan, Resumer, Switched,
 };
-use super::source::{SessionFilter, SessionPreview, SessionRow, SessionSource};
+use super::source::{SessionFilter, SessionPreview, SessionRow, SessionSource, TranscriptEntry};
 
 #[derive(Debug)]
 pub enum Request {
     Search {
         generation: u64,
-        mode: FilterMode,
         filter: SessionFilter,
     },
     Preview(HarnessSession),
+    /// The whole conversation, for the reader.
+    Transcript(HarnessSession),
     /// The forks grouped under a root.
     Children(HarnessSession),
     /// Plan resuming a session (may walk the harness's session directories).
@@ -73,10 +73,10 @@ pub enum Request {
 pub enum Response {
     Results {
         generation: u64,
-        mode: FilterMode,
         rows: Result<Vec<SessionRow>, String>,
     },
     Preview(HarnessSession, SessionPreview),
+    Transcript(HarnessSession, Vec<TranscriptEntry>),
     Children(HarnessSession, Vec<SessionRow>),
     Plan(HarnessSession, Result<Resume, NotResumable>),
     /// The session is restored (or couldn't be): the plan that resumes it.
@@ -143,20 +143,11 @@ async fn searches(
         while let Ok(next) = requests.try_recv() {
             request = next;
         }
-        let Request::Search {
-            generation,
-            mode,
-            filter,
-        } = request
-        else {
+        let Request::Search { generation, filter } = request else {
             continue;
         };
         let rows = source.search(&filter).await.map_err(|e| format!("{e:#}"));
-        let response = Response::Results {
-            generation,
-            mode,
-            rows,
-        };
+        let response = Response::Results { generation, rows };
         if responses.send(response).is_err() {
             return;
         }
@@ -167,6 +158,7 @@ async fn searches(
 #[derive(Default)]
 struct Latest {
     preview: Option<Request>,
+    transcript: Option<Request>,
     children: Option<Request>,
     plan: Option<Request>,
     accept: Option<Request>,
@@ -183,6 +175,7 @@ impl Latest {
     fn put(&mut self, request: Request) -> Option<HarnessSession> {
         let slot = match request {
             Request::Preview(_) => &mut self.preview,
+            Request::Transcript(_) => &mut self.transcript,
             Request::Children(_) => &mut self.children,
             Request::Plan(_) => &mut self.plan,
             Request::Accept(_) => &mut self.accept,
@@ -209,7 +202,7 @@ impl Latest {
 
     /// The next to answer: a continuation, the restore, then the plan an enter is waiting on (an
     /// enter waits on any of them), then the selection's plan (one may soon be), then what the
-    /// chooser shows, then children, then the preview.
+    /// chooser shows, then children, then the preview, then the transcript.
     fn take(&mut self) -> Option<Request> {
         self.continuation
             .take()
@@ -219,6 +212,7 @@ impl Latest {
             .or_else(|| self.flatten.take())
             .or_else(|| self.children.take())
             .or_else(|| self.preview.take())
+            .or_else(|| self.transcript.take())
     }
 }
 
@@ -261,6 +255,13 @@ async fn details(
                     SessionPreview::default()
                 });
                 Response::Preview(session, preview)
+            }
+            Request::Transcript(session) => {
+                let transcript = source.transcript(&session).await.unwrap_or_else(|e| {
+                    tracing::warn!("failed to load the transcript for {session:?}: {e:#}");
+                    Vec::new()
+                });
+                Response::Transcript(session, transcript)
             }
             Request::Children(session) => {
                 let children = source.children(&session).await.unwrap_or_else(|e| {
@@ -336,7 +337,6 @@ mod tests {
         let (tx, mut rx) = spawn(Arc::new(FakeSource::new()), Arc::new(FakeResumer::default()));
         tx.send(Request::Search {
             generation: 1,
-            mode: FilterMode::Global,
             filter: roots(),
         });
         let Some(Response::Results {
@@ -422,7 +422,6 @@ mod tests {
         }
         tx.send(Request::Search {
             generation: 7,
-            mode: FilterMode::Global,
             filter: roots(),
         });
         let Some(Response::Results { generation, .. }) = rx.recv().await else {

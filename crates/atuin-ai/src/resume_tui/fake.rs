@@ -29,7 +29,10 @@ use super::resumer::{
     Continued, ForkFrom, Forked, NotResumable, Restore, Resume, ResumeError, ResumePlan,
     ResumeTarget, Resumer, Switched,
 };
-use super::source::{Relation, SessionFilter, SessionPreview, SessionRow, SessionSource, Snippet};
+use super::source::{
+    Relation, SessionFilter, SessionPreview, SessionRow, SessionSource, Snippet, TranscriptBuilder,
+    TranscriptEntry,
+};
 
 pub const THIS_HOST_ID: &str = "01900000000070008000000000000001";
 pub const REPO: &str = "/home/ellie/src/atuin";
@@ -940,6 +943,19 @@ impl SessionSource for FakeSource {
                 .find(|(r, _)| *r == Role::Assistant)
                 .map(|(_, t)| (*t).to_owned()),
         })
+    }
+
+    async fn transcript(&self, session: &HarnessSession) -> eyre::Result<Vec<TranscriptEntry>> {
+        let mut transcript = TranscriptBuilder::default();
+        if let Some(s) = self.sessions.iter().find(|s| &s.row.handle == session) {
+            for (role, text) in &s.messages {
+                match role {
+                    Role::User => transcript.prompt(text),
+                    Role::Assistant => transcript.reply(text),
+                }
+            }
+        }
+        Ok(transcript.finish())
     }
 
     async fn children(&self, session: &HarnessSession) -> eyre::Result<Vec<SessionRow>> {

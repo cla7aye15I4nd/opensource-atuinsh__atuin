@@ -18,6 +18,7 @@ pub mod keymap;
 mod markdown;
 pub mod panel;
 pub mod query;
+pub mod reader;
 pub mod rebuild;
 pub mod render;
 pub mod resumer;
@@ -46,7 +47,8 @@ use self::catchup::{Branch, CatchUp};
 use self::chooser::Destination;
 use self::resumer::{Continued, Forked, NotResumable, Resume, Switched};
 use self::state::{
-    CHILDREN, Continuing, InputAction, PLAN, PREVIEW, Pending, Picked, RESTORE, State, Writing,
+    CHILDREN, Continuing, InputAction, PLAN, PREVIEW, Pending, Picked, RESTORE, State, TRANSCRIPT,
+    Writing,
 };
 use self::worker::{Request, Requests, Response};
 
@@ -60,6 +62,28 @@ const REFRESH_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 const SETTLE: Duration = Duration::from_millis(60);
 /// How often the picker asks the daemon whether it is rebuilding the session index.
 const REBUILD_PROBE_EVERY: Duration = Duration::from_secs(2);
+
+/// When `atuin ai resume` started, for [`startup`]'s timings.
+static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Note in the log how long after starting the picker got to `step` (the first call starts the
+/// clock). Only the first time each step is reached, so a slow start can be told apart from a
+/// slow step later on.
+pub fn startup(step: &'static str) {
+    static SEEN: parking_lot::Mutex<Vec<&'static str>> = parking_lot::const_mutex(Vec::new());
+    let started = *STARTED.get_or_init(Instant::now);
+    let first = {
+        let mut seen = SEEN.lock();
+        let first = !seen.contains(&step);
+        if first {
+            seen.push(step);
+        }
+        first
+    };
+    if first {
+        tracing::info!(elapsed = ?started.elapsed(), "ai resume startup: {step}");
+    }
+}
 
 /// Where the picker runs: what its filter modes resolve against.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -194,6 +218,9 @@ fn request_details(state: &mut State, requests: &Requests, settle: &mut Settle) 
     if state.wants_preview(&handle) && state.requested.insert((handle.clone(), PREVIEW)) {
         requests.send(Request::Preview(handle.clone()));
     }
+    if state.wants_transcript(&handle) && state.requested.insert((handle.clone(), TRANSCRIPT)) {
+        requests.send(Request::Transcript(handle.clone()));
+    }
     // Inspect lists the forks; the detail pane and the preview count them. A row with nothing
     // grouped under it has none (one with only subagents has none either, which takes asking).
     let wants_children = state.tab_index == 1 || row.children > 0;
@@ -234,35 +261,34 @@ fn request_plan(state: &mut State, requests: &Requests, row: &SessionRow) {
 }
 
 fn send_search(state: &mut State, requests: &Requests) {
-    if let Some((generation, mode, filter)) = state.next_search() {
-        requests.send(Request::Search {
-            generation,
-            mode,
-            filter,
-        });
+    if let Some((generation, filter)) = state.next_search() {
+        requests.send(Request::Search { generation, filter });
     }
 }
 
 /// Apply a worker response.
 fn apply_response(state: &mut State, response: Response, requests: &Requests) {
     match response {
-        Response::Results {
-            generation,
-            mode,
-            rows,
-        } => match rows {
+        Response::Results { generation, rows } => match rows {
             Ok(rows) => {
-                if state.apply_results(generation, mode, rows) {
-                    // A widened workspace needs a new search.
-                    send_search(state, requests);
-                }
+                startup("first results");
+                state.apply_results(generation, rows);
+                // An empty workspace falls back to every session: search again.
+                send_search(state, requests);
             }
             Err(e) if generation == state.issued => {
                 state.status = Some((format!("search failed: {e}"), Meaning::AlertError));
             }
             Err(_) => {}
         },
-        Response::Preview(handle, preview) => state.apply_preview(handle, preview),
+        Response::Preview(handle, preview) => {
+            startup("first preview");
+            state.apply_preview(handle, preview);
+        }
+        Response::Transcript(handle, entries) => {
+            startup("first transcript");
+            state.apply_transcript(handle, entries);
+        }
         Response::Children(handle, children) => {
             state.children.insert(handle, children);
         }
@@ -837,8 +863,10 @@ impl Picker<'_> {
         if inline_height > 0 {
             terminal.clear()?;
         }
+        startup("terminal ready");
         // Paint before the first search answers, so the picker shows up immediately.
         terminal.draw(|f| state.draw(f, settings, self.theme))?;
+        startup("first frame drawn");
         send_search(&mut state, &requests);
 
         let mut events = terminal::Events::new();
@@ -911,10 +939,10 @@ impl Picker<'_> {
                     // Not while typing or browsing: the list shouldn't move under the cursor.
                     if last_input.elapsed() >= REFRESH_IDLE
                         && last_refresh.elapsed() >= REFRESH_EVERY
-                        && let Some((generation, mode, filter)) = state.refresh()
+                        && let Some((generation, filter)) = state.refresh()
                     {
                         last_refresh = std::time::Instant::now();
-                        requests.send(Request::Search { generation, mode, filter });
+                        requests.send(Request::Search { generation, filter });
                     }
                 }
                 changed = rebuilding.changed(), if probing => {

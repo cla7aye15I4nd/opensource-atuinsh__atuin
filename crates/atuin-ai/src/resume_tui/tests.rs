@@ -11,7 +11,7 @@ use rstest::rstest;
 use super::fake::{self, FakeResumer, FakeSource};
 use super::resumer::Resumer;
 use super::source::SessionSource;
-use super::state::State;
+use super::state::{Pane, State};
 
 fn settings() -> Settings {
     let mut s = Settings::utc();
@@ -20,6 +20,8 @@ fn settings() -> Settings {
     s.enter_accept = true;
     s.show_preview = true;
     s.max_preview_height = 4;
+    // The fixtures are laid out around the workspace filter.
+    s.ai.sessions.filter_mode = Some(atuin_client::settings::AiSessionFilterMode::Workspace);
     s
 }
 
@@ -31,9 +33,9 @@ async fn loaded(settings: &Settings, query: &str, tab: usize) -> State {
     state.now = Box::new(fake::now);
     state.input = Cursor::from(query.to_owned());
     state.input.end();
-    while let Some((generation, mode, filter)) = state.next_search() {
+    while let Some((generation, filter)) = state.next_search() {
         let rows = source.search(&filter).await.unwrap();
-        state.apply_results(generation, mode, rows);
+        state.apply_results(generation, rows);
     }
     for row in &state.results {
         state.previews.insert(row.handle.clone(), source.preview(&row.handle).await.unwrap());
@@ -65,6 +67,23 @@ fn text(buf: &Buffer) -> String {
         .join("\n")
 }
 
+/// The scope highlighted in the input's list of them (`all`, `repo`, …).
+fn current_scope(buf: &Buffer) -> String {
+    let area = buf.area;
+    let y = (0..area.height)
+        .find(|&y| {
+            let line: String = (0..area.width).map(|x| buf[(x, y)].symbol().to_owned()).collect();
+            line.contains("ctrl-r ")
+        })
+        .expect("the scopes are shown");
+    (0..area.width)
+        .filter(|&x| buf[(x, y)].modifier.contains(ratatui::style::Modifier::REVERSED))
+        .map(|x| buf[(x, y)].symbol().to_owned())
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 async fn frame(settings: &Settings, query: &str, tab: usize, w: u16, h: u16) -> String {
     let mut state = loaded(settings, query, tab).await;
     text(&render(&mut state, settings, w, h))
@@ -76,26 +95,36 @@ async fn full_frame_has_history_search_chrome() {
     let out = frame(&settings(), "", 0, 100, 30).await;
     let lines: Vec<&str> = out.lines().collect();
     assert!(lines[0].contains(&format!("Atuin v{}", env!("CARGO_PKG_VERSION"))), "{out}");
-    assert!(lines[0].contains("<esc>: exit, <tab>: edit, <enter>: resume, <ctrl-o>: inspect"));
+    // What the keys do to the selected session.
+    assert!(lines[0].contains("enter resume in Claude Code · tab edit command · "), "{out}");
     assert!(lines[0].trim_end().ends_with("sessions"), "{out}");
     assert!(lines[1].contains("Search") && lines[1].contains("Inspect"));
     assert!(lines[2].trim_start().starts_with('╭'), "list block opens the box: {out}");
-    assert!(out.contains("[  WORKSPACE 10  ]"), "the count beside the mode: {out}");
+    // The scopes beside the query, the one listed highlighted.
+    assert!(out.contains("ctrl-r  all  repo  branch  dir  host"), "{out}");
     assert!(out.lines().last().unwrap().trim_start().starts_with('╰'), "{out}");
 }
 
-/// Rows are the time, the harness, the title and the message count: nothing about where.
+/// A row is two lines: the time, title and message count, then the agent and where the session
+/// ran. Newest first, they are grouped under a heading for each day.
 #[rstest]
 #[tokio::test]
-async fn rows_show_time_badge_title_and_count() {
+async fn rows_show_the_title_then_the_agent_and_where() {
     let out = frame(&settings(), "", 0, 100, 30).await;
-    // The newest session sits at the bottom (not inverted), selected.
-    let selected = out.lines().find(|l| l.contains(" > ")).unwrap();
-    assert!(selected.contains("● now CC Add an interactive resume picker"), "{selected}");
-    assert!(selected.trim_end_matches(['│', ' ']).ends_with("142"), "{selected}");
-    // No `+N`, repository or branch on the row.
+    let lines: Vec<&str> = out.lines().collect();
+    // The newest session sits at the bottom (not inverted), selected, under today's heading.
+    let at = lines.iter().position(|l| l.contains(" > ")).unwrap();
+    let selected = lines[at];
+    assert!(selected.contains(" > Add an interactive resume picker"), "{selected}");
+    assert!(selected.trim_end_matches(['│', '┃', ' ']).ends_with("142"), "{selected}");
+    // When, the agent and where, under the title.
+    assert!(lines[at + 1].contains("│   ● now · Claude Code · atuin · ai-resume"), "{out}");
+    let heading = lines[..at].iter().rev().find(|l| l.contains(" ───")).unwrap();
+    assert!(heading.contains("Today ──"), "{out}");
+    // Times say only the time of day under their day's heading.
+    assert!(out.contains("Yesterday ──") && out.contains("│   15:00 · Pi · atuin · main"), "{out}");
+    // No `+N` on the row.
     assert!(!selected.contains("+4") && !selected.contains("+1"), "{selected}");
-    assert!(!selected.contains("ai-resume"), "{selected}");
     // Workspace hides the dotfiles and remote sessions.
     assert!(!out.contains("dotfiles"), "{out}");
     // Subagents are never listed.
@@ -103,18 +132,21 @@ async fn rows_show_time_badge_title_and_count() {
 }
 
 /// Other hosts' sessions look like this host's: they resume by being restored from sync,
-/// behind the scenes. Only the preview says where one ran.
+/// behind the scenes. Only the line saying where one ran names its host.
 #[rstest]
 #[tokio::test]
 async fn other_hosts_rows_look_like_this_hosts() {
     let mut state = loaded(&settings(), "", 0).await;
     state.mode = atuin_client::settings::AiSessionFilterMode::Global;
     let source = FakeSource::new();
-    let (generation, mode, filter) = state.next_search().unwrap();
-    state.apply_results(generation, mode, source.search(&filter).await.unwrap());
+    let (generation, filter) = state.next_search().unwrap();
+    state.apply_results(generation, source.search(&filter).await.unwrap());
     let buf = render(&mut state, &settings(), 100, 30);
     let out = text(&buf);
-    assert!(!out.contains('@'), "no host on any row: {out}");
+    let lines: Vec<&str> = out.lines().collect();
+    let bisect = lines.iter().position(|l| l.contains("Bisect the aarch64")).unwrap();
+    assert!(!lines[bisect].contains('@'), "no host on the title: {out}");
+    assert!(lines[bisect + 1].contains("· @00000002"), "only where it ran: {out}");
     let (y, line) =
         out.lines().enumerate().find(|(_, l)| l.contains("Bisect the aarch64")).unwrap();
     let x = u16::try_from(line.find("Bisect").unwrap()).unwrap();
@@ -124,30 +156,32 @@ async fn other_hosts_rows_look_like_this_hosts() {
     let remote = state.results.iter().position(|r| r.host_id != fake::THIS_HOST_ID).unwrap();
     state.list.selected = remote;
     let out = text(&render(&mut state, &settings(), 100, 30));
-    assert!(out.contains("│       atuin · main · @00000002"), "{out}");
+    assert!(out.contains("atuin · main · @00000002"), "{out}");
     assert!(!out.contains("from sync"), "{out}");
 }
 
-/// The preview's first line says where the session ran and what forked off it, in place of a
-/// line of text, leaving out this host and a detached branch; with no room for it, the text
-/// keeps the line.
+/// The preview's first line says what forked off the session, in place of a line of text
+/// (where it ran is under its title in the list); with no room for it, or nothing forked, the
+/// text keeps the line.
 #[rstest]
 #[tokio::test]
-async fn the_preview_says_where_a_session_ran() {
+async fn the_preview_says_what_forked_off_a_session() {
     let s = markdown_settings(4);
     let out = frame(&s, "", 0, 100, 30).await;
-    let preview = section(&out, "atuin", "╰");
+    let preview = section(&out, "1 fork", "╰");
     assert_eq!(preview.len(), 4, "{out}");
-    assert_eq!(preview[0], "       atuin · ai-resume · 1 fork", "{out}");
+    assert_eq!(preview[0], "       1 fork", "{out}");
     assert!(preview[1].starts_with("first  "), "{out}");
 
     let out = frame(&markdown_settings(1), "", 0, 100, 30).await;
-    assert!(!out.contains("atuin · ai-resume"), "{out}");
+    assert!(!out.contains("1 fork"), "{out}");
     assert!(out.contains("first  "), "{out}");
 
     // Nothing grouped under it: no count.
     let out = frame(&s, "flaky", 0, 100, 30).await;
-    assert_eq!(section(&out, "atuin", "╰")[0], "       atuin · main", "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    let first = lines.iter().position(|l| l.contains("first  ")).expect(&out);
+    assert!(lines[first - 2].contains('›'), "the input, then the text: {out}");
 }
 
 /// Inspecting another host's session says how it resumes, hinting that it comes from sync.
@@ -295,9 +329,11 @@ async fn inspect_explains_unresumable_sessions() {
 async fn compact_and_inline_heights() {
     let mut s = settings();
     // Auto style goes compact under 14 rows, like history search.
-    let out = frame(&s, "", 0, 80, 13).await;
+    let mut state = loaded(&s, "", 0).await;
+    let buf = render(&mut state, &s, 80, 13);
+    let out = text(&buf);
     assert!(!out.contains('╭'), "compact has no borders: {out}");
-    assert!(out.contains("[  WORKSPACE 10  ]"), "{out}");
+    assert_eq!(current_scope(&buf), "repo", "{out}");
 
     // 80x14 is still full.
     let out = frame(&s, "", 0, 80, 14).await;
@@ -315,10 +351,12 @@ async fn invert_puts_the_input_on_top() {
     s.invert = true;
     let out = frame(&s, "", 0, 100, 30).await;
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines[1].contains("WORKSPACE"), "input first when inverted: {out}");
-    // The best match is at the top.
-    assert!(lines[3].contains(" > ") && lines[3].contains("Add an interactive"), "{out}");
-    assert!(lines.last().unwrap().contains("<esc>: exit"));
+    assert!(lines[1].contains("ctrl-r "), "input first when inverted: {out}");
+    // The newest is at the top, under today's heading, with where it ran under it.
+    assert!(lines[3].contains("Today ──"), "{out}");
+    assert!(lines[4].contains(" > ") && lines[4].contains("Add an interactive"), "{out}");
+    assert!(lines[5].contains("now · Claude Code · atuin"), "{out}");
+    assert!(lines.last().unwrap().contains("esc exit"), "{out}");
 }
 
 #[rstest]
@@ -336,19 +374,21 @@ async fn vim_normal_highlights_the_whole_row() {
 
 #[rstest]
 #[tokio::test]
-async fn no_sessions_in_workspace_widens() {
+async fn opens_on_every_session() {
     let mut ctx = fake::context();
     ctx.cwd = "/home/ellie/src/empty".into();
     ctx.git_root = Some("/home/ellie/src/empty".into());
     let source = FakeSource::new();
-    let s = settings();
+    let mut s = settings();
+    s.ai.sessions.filter_mode = None;
     let mut state = State::new(&s, ctx, "");
     state.now = Box::new(fake::now);
-    while let Some((generation, mode, filter)) = state.next_search() {
-        state.apply_results(generation, mode, source.search(&filter).await.unwrap());
+    while let Some((generation, filter)) = state.next_search() {
+        state.apply_results(generation, source.search(&filter).await.unwrap());
     }
-    let out = text(&render(&mut state, &s, 100, 30));
-    assert!(out.contains("[  WS→GLOBAL 14  ]"), "{out}");
+    let buf = render(&mut state, &s, 100, 30);
+    let out = text(&buf);
+    assert_eq!(current_scope(&buf), "all", "{out}");
     assert!(out.contains("Bisect the aarch64"), "{out}");
 }
 
@@ -371,6 +411,41 @@ async fn wide_terminals_split_the_list_and_a_detail_pane() {
     // Narrower terminals keep the strip.
     let out = frame(&settings(), "", 0, 119, 30).await;
     assert!(out.contains("first  "));
+}
+
+/// The selected session's transcript, read.
+async fn read_transcript(state: &mut State) {
+    let handle = state.selected().unwrap().handle.clone();
+    let transcript = FakeSource::new().transcript(&handle).await.unwrap();
+    state.apply_transcript(handle, transcript);
+}
+
+#[rstest]
+#[tokio::test]
+async fn the_detail_pane_reads_the_whole_conversation_from_the_match() {
+    let s = settings();
+    let mut state = loaded(&s, "subagents", 0).await;
+    read_transcript(&mut state).await;
+    let out = text(&render(&mut state, &s, 140, 30));
+    // The conversation in place of the preview's parts, opened at the prompt that matched.
+    assert!(!out.contains("First prompt"), "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    let you = lines.iter().position(|l| l.contains("│ You ")).expect(&out);
+    assert!(lines[you + 1].contains("Group forks and subagents"), "{out}");
+    assert!(!out.contains("Build atuin ai resume"), "the start is above: {out}");
+    assert!(out.contains("Claude Code   "), "the agent's heading: {out}");
+
+    // Scrolled back up, it starts at the first prompt.
+    let at = state.scrolls[Pane::Side as usize].offset;
+    assert!(at > 0);
+    state.scroll_pane(Pane::Side, -isize::try_from(at).unwrap());
+    let out = text(&render(&mut state, &s, 140, 30));
+    assert!(out.contains("Build atuin ai resume"), "{out}");
+
+    // A new query opens it at that match.
+    state.input = Cursor::from("subagents floods".to_owned());
+    let out = text(&render(&mut state, &s, 140, 30));
+    assert!(!out.contains("Build atuin ai resume"), "{out}");
 }
 
 #[rstest]
@@ -493,7 +568,7 @@ async fn with_chooser(settings: &Settings, query: &str, action: super::state::Pe
 }
 
 /// Enter on a session asks where to resume it: its own harness first and selected, then the
-/// other harnesses installed here, saying what continuing there flattens. Enter picks the
+/// other harnesses installed here, under a rule, to continue it in. Enter picks the
 /// selected line the way the key that opened it asked (resume, with `enter_accept`), tab edits,
 /// a digit picks its line, and nothing reaches the query while it's open.
 #[rstest]
@@ -506,19 +581,29 @@ async fn the_chooser_offers_the_original_first_then_the_others() {
     let s = settings();
     let mut state = with_chooser(&s, "", Pending::Resume).await;
     let out = text(&render(&mut state, &s, 100, 30));
-    assert!(out.contains("╭ Resume in "), "{out}");
-    assert!(out.contains("> 1 CC Claude Code  original"), "{out}");
-    assert!(out.contains("  2 CC Claude Code  fork: new session, same history"), "{out}");
-    assert!(
-        out.contains("  3 CX Codex        continue, 42 tool calls become notes, reasoning dropped")
-    );
-    assert!(out.contains("  4 OC opencode     continue, 42 tool calls"), "{out}");
-    assert!(out.contains("  5 PI Pi           continue, 42 tool calls"), "{out}");
-    assert!(out.contains("<enter>: resume  <tab>: edit  <esc>: back"), "{out}");
-    // It opens over the list, against the selected row, which stays in sight below it.
+    // It opens in the list, under the selected row, the two in a border that marks the row in
+    // place of the indicator.
     let lines: Vec<&str> = out.lines().collect();
-    let bottom = lines.iter().position(|l| l.contains('╰') && l.contains("──╯")).unwrap();
-    assert!(lines[bottom + 1].contains(" > "), "{out}");
+    let row = lines.iter().position(|l| l.contains("Add an interactive")).expect(&out);
+    assert!(lines[row].contains("││  Add an interactive"), "no indicator: {out}");
+    assert!(lines[row - 1].contains("│╭──"), "{out}");
+    assert!(lines[row + 2].contains("││  > 1 Claude Code  resume"), "{out}");
+    let pi = lines.iter().position(|l| l.contains("  5 Pi")).expect(&out);
+    assert!(lines[pi + 1].contains("│╰──"), "{out}");
+    assert!(!out.contains("╭ Resume in"), "no popup: {out}");
+    assert!(out.contains("  2 Claude Code  fork: new session, same history"), "{out}");
+    // The other agents under a titled rule.
+    let lines: Vec<&str> = out.lines().collect();
+    let codex = lines.iter().position(|l| l.contains("  3 Codex")).expect(&out);
+    assert!(lines[codex - 1].contains("Continue in ────"), "{out}");
+    assert!(lines[codex + 1].contains("  4 opencode"), "{out}");
+    assert!(lines[codex + 2].contains("  5 Pi"), "{out}");
+    assert!(!out.contains("tool calls"), "{out}");
+    assert!(!out.contains("reasoning"), "{out}");
+    // Its keys are in the header, not the popup.
+    let header = out.lines().next().unwrap();
+    assert!(header.contains("enter resume · tab edit command · esc back"), "{out}");
+    assert!(!out.contains("<enter>"), "{out}");
 
     assert_eq!(press(&mut state, &s, "x"), InputAction::Continue);
     assert_eq!(press(&mut state, &s, "enter"), picked(&state, None, Pending::Resume));
@@ -556,7 +641,7 @@ async fn a_chooser_opened_to_edit_edits() {
     let s = settings();
     let mut state = with_chooser(&s, "", Pending::Edit).await;
     let out = text(&render(&mut state, &s, 100, 30));
-    assert!(out.contains("<enter>: edit  <esc>: back"), "{out}");
+    assert!(out.lines().next().unwrap().contains("enter edit command · esc back"), "{out}");
     assert_eq!(press(&mut state, &s, "enter"), picked(&state, None, Pending::Edit));
     let mut state = with_chooser(&s, "", Pending::Edit).await;
     assert_eq!(press(&mut state, &s, "3"), picked(&state, Some(HarnessKind::Codex), Pending::Edit));
@@ -571,8 +656,9 @@ async fn a_session_from_another_host_hints_it_comes_from_sync() {
     let s = chooser_settings();
     let mut state = with_chooser(&s, "aarch64", Pending::Resume).await;
     let out = text(&render(&mut state, &s, 100, 30));
-    assert!(out.contains("> 1 CC Claude Code  original, from sync"), "{out}");
-    assert!(out.contains("  3 CX Codex        continue"), "{out}");
+    assert!(out.contains("> 1 Claude Code  resume, from sync"), "{out}");
+    assert!(out.contains("Continue in ──"), "{out}");
+    assert!(out.contains("  3 Codex"), "{out}");
 }
 
 /// A session its own harness can't resume here (a subagent, a deleted directory, a harness
@@ -597,12 +683,12 @@ async fn an_original_that_cant_resume_is_dimmed_and_passed_over() {
     state.open_chooser(&row, targets.clone(), false, Pending::Resume);
     let buf = render(&mut state, &s, 100, 30);
     let out = text(&buf);
-    let (y, line) = out.lines().enumerate().find(|(_, l)| l.contains("1 PI Pi")).unwrap();
-    assert!(line.contains("Pi           original: the session's directory is gone"), "{out}");
+    let (y, line) = out.lines().enumerate().find(|(_, l)| l.contains("1 Pi")).unwrap();
+    assert!(line.contains("Pi           resume: the session's directory is gone"), "{out}");
     let x = u16::try_from(line[..line.find("Pi ").unwrap()].chars().count()).unwrap();
     let cell = &buf[(x, u16::try_from(y).unwrap())];
     assert!(cell.modifier.contains(ratatui::style::Modifier::DIM), "dimmed");
-    assert!(out.contains("> 2 CC Claude Code"), "the first line that works is selected: {out}");
+    assert!(out.contains("> 2 Claude Code"), "the first line that works is selected: {out}");
 
     assert_eq!(press(&mut state, &s, "1"), InputAction::Continue);
     let (status, _) = state.status.clone().unwrap();
@@ -637,7 +723,7 @@ async fn an_original_that_cant_resume_is_dimmed_and_passed_over() {
         Pending::Resume,
     );
     let out = text(&render(&mut state, &s, 100, 30));
-    assert!(out.contains("> 1 CP Copilot  original: atuin can't resume"), "{out}");
+    assert!(out.contains("> 1 Copilot  resume: atuin can't resume"), "{out}");
     assert!(!out.contains("fork:"), "atuin can't fork it either: {out}");
 }
 
@@ -664,7 +750,7 @@ async fn f_selects_the_fork_under_the_original() {
         let mut state = with_chooser(&s, "", Pending::Resume).await;
         assert_eq!(press(&mut state, &s, "f"), InputAction::Continue);
         let out = text(&render(&mut state, &s, 100, 30));
-        assert!(out.contains("> 2 CC Claude Code  fork: new session, same history"), "{out}");
+        assert!(out.contains("> 2 Claude Code  fork: new session, same history"), "{out}");
         assert_eq!(press(&mut state, &s, key), fork(&state, action), "{key}");
     }
     let mut state = with_chooser(&s, "", Pending::Edit).await;
@@ -735,9 +821,9 @@ async fn a_session_with_nothing_to_fork_never_picks_the_fork(#[values(false, tru
     let mut row = state.chooser.as_ref().unwrap().row.clone();
     let out = text(&render(&mut state, &s, 100, 30));
     if empty {
-        assert!(out.contains("  2 CC Claude Code  fork: the session has no messages"), "{out}");
+        assert!(out.contains("  2 Claude Code  fork: the session has no messages"), "{out}");
     } else {
-        assert!(out.contains("  2 CC Claude Code  fork: new session, same history"), "{out}");
+        assert!(out.contains("  2 Claude Code  fork: new session, same history"), "{out}");
     }
     for keys in [&["2"][..], &["f", "enter"], &["f", "tab"], &["f", "ctrl-y"]] {
         let mut state = chooser().await;
@@ -949,12 +1035,11 @@ async fn a_refresh_does_not_drop_a_waiting_resume(#[case] query: &str, #[case] h
     assert!(state.pending.is_some());
 
     // An idle refresh: the session is gone from the results.
-    let (generation, mode, filter) = state.refresh().unwrap();
+    let (generation, filter) = state.refresh().unwrap();
     let mut rows = FakeSource::new().search(&filter).await.unwrap();
     rows.retain(|r| r.handle != row.handle);
     let results = Response::Results {
         generation,
-        mode,
         rows: Ok(rows),
     };
     assert_eq!(respond(&mut state, results, resumer.as_ref(), &requests), None);
@@ -1313,7 +1398,7 @@ async fn a_written_continuation_resumes_or_edits_its_new_session() {
         let id = state.continued;
         let continued = resumer.continue_in(&source, &row, HarnessKind::Codex).await;
         let (outcome, status) = finish_continuation(&mut state, id, continued).unwrap();
-        assert_eq!(status, "continuing in Codex: 42 tool calls become notes, reasoning dropped");
+        assert_eq!(status, "continuing in Codex: 42 tool calls become notes");
         let plan = match (outcome, run) {
             (Outcome::Resume(plan), true) | (Outcome::Edit(plan), false) => plan,
             (other, _) => panic!("{other:?}"),
@@ -1726,7 +1811,7 @@ async fn rows_fit_every_width(#[values(false, true)] global: bool) {
     }
 }
 
-/// The header and the mode prefix say when the search stopped at its limit.
+/// The header says when the search stopped at its limit.
 #[rstest]
 #[tokio::test]
 async fn a_capped_list_says_so() {
@@ -1740,7 +1825,6 @@ async fn a_capped_list_says_so() {
         (0..SEARCH_LIMIT).map(|i| fake::row(HarnessKind::Codex, &format!("s{i}"), "t")).collect();
     let out = text(&render(&mut state, &s, 100, 30));
     assert!(out.lines().next().unwrap().ends_with("500+ sessions"), "{out}");
-    assert!(out.contains("[ WORKSPACE 500+ ]"), "{out}");
 }
 
 /// A session that is still running says what resuming it does, without stopping it; the fork is
@@ -1757,17 +1841,17 @@ async fn the_chooser_says_a_live_session_is_running() {
     state.open_chooser(&row, resumer.continue_targets(&row), true, Pending::Resume);
     let out = text(&render(&mut state, &s, 100, 30));
     assert!(
-        out.contains("  1 CC Claude Code  original · running elsewhere — resuming forks it"),
+        out.contains("  1 Claude Code  resume · running elsewhere — resuming forks it"),
         "{out}"
     );
-    assert!(out.contains("> 2 CC Claude Code  fork: new session, same history"), "{out}");
+    assert!(out.contains("> 2 Claude Code  fork: new session, same history"), "{out}");
     press(&mut state, &s, "up");
     assert_eq!(press(&mut state, &s, "enter"), picked(&state, None, Pending::Resume));
 
     // Not once it has stopped.
     let mut state = with_chooser(&s, "flaky", Pending::Resume).await;
     let out = text(&render(&mut state, &s, 100, 30));
-    assert!(out.contains("> 1 CX Codex        original "), "{out}");
+    assert!(out.contains("> 1 Codex        resume "), "{out}");
     assert!(!out.contains("running elsewhere"), "{out}");
 }
 
@@ -1803,9 +1887,9 @@ fn wheel(state: &mut State, settings: &Settings, down: bool, column: u16, row: u
     let _ = state.handle_input(settings, &event);
 }
 
-/// The strip's lines, borders and scrollbar stripped.
+/// The strip's lines (from the selected session's fork count), borders and scrollbar stripped.
 fn strip(out: &str) -> String {
-    section(out, "atuin · ai-resume", "╰").join("\n")
+    section(out, "1 fork", "╰").join("\n")
 }
 
 /// At the top the strip is the overview (each part a line or two); scrolled, it is the parts in
@@ -1828,7 +1912,7 @@ async fn the_strip_scrolls_through_the_parts_in_full() {
     assert!(scrolled.contains("• resume on enter, edit on tab"), "{scrolled}");
     assert!(!scrolled.contains("first  Build"), "{scrolled}");
     // The metadata line stays put.
-    assert!(out.contains("atuin · ai-resume · 1 fork"), "{out}");
+    assert!(out.contains("│       1 fork"), "{out}");
 
     state.scroll_pane(Pane::Strip, 10_000);
     let out = text(&render(&mut state, &s, 100, 30));
@@ -1900,7 +1984,7 @@ async fn the_wheel_scrolls_the_pane_under_it(#[case] origin: u16) {
 /// The keys scroll whichever preview is showing: the strip, the pane beside the list, or
 /// Inspect's conversation (whose fields stay put).
 #[rstest]
-#[case::strip(0, 100, "atuin · ai-resume · 1 fork")]
+#[case::strip(0, 100, "│       1 fork")]
 #[case::side(0, 150, "Claude Code · claude-opus-4-5")]
 #[case::inspect(1, 100, "Session   7f3c9a12")]
 #[tokio::test]
@@ -1942,7 +2026,7 @@ async fn the_preview_never_blanks_between_selections() {
     let mut state = loaded(&s, "", 0).await;
     let before = text(&render(&mut state, &s, 100, 30));
     state.preview_drawn(Instant::now());
-    let input_row = |out: &str| out.lines().position(|l| l.contains("[  WORKSPACE")).unwrap();
+    let input_row = |out: &str| out.lines().position(|l| l.contains("ctrl-r ")).unwrap();
 
     let next = state.results[1].clone();
     let preview = state.previews.remove(&next.handle).unwrap();
@@ -1975,12 +2059,12 @@ async fn a_refresh_keeps_the_frame_as_it_was() {
         let s = settings();
         let mut state = loaded(&s, "", 0).await;
         let before = text(&render(&mut state, &s, width, 30));
-        let (generation, mode, filter) = state.refresh().unwrap();
+        let (generation, filter) = state.refresh().unwrap();
         let selected = state.selected().unwrap().handle.clone();
         assert!(state.wants_preview(&selected), "the live session's preview is read again");
         assert_eq!(text(&render(&mut state, &s, width, 30)), before);
         let rows = FakeSource::new().search(&filter).await.unwrap();
-        state.apply_results(generation, mode, rows);
+        state.apply_results(generation, rows);
         assert_eq!(text(&render(&mut state, &s, width, 30)), before);
     }
 }
@@ -1992,7 +2076,7 @@ async fn a_refresh_keeps_the_frame_as_it_was() {
 async fn the_automatic_strip_height_only_grows() {
     let s = settings();
     let mut state = loaded(&s, "", 0).await;
-    let input_row = |out: &str| out.lines().position(|l| l.contains("[  WORKSPACE")).unwrap();
+    let input_row = |out: &str| out.lines().position(|l| l.contains("ctrl-r ")).unwrap();
     let tall = input_row(&text(&render(&mut state, &s, 100, 30)));
     let short = state
         .results
@@ -2176,7 +2260,7 @@ async fn a_clipped_chooser_keeps_the_selected_line_in_sight() {
 
     let s = settings();
     let mut state = with_chooser(&s, "", Pending::Resume).await;
-    let lines = ["1 CC Claude Code", "2 CC Claude Code", "3 CX Codex", "4 OC opencode", "5 PI Pi"];
+    let lines = ["1 Claude Code", "2 Claude Code", "3 Codex", "4 opencode", "5 Pi"];
     let steps = [(None, 0), (Some("down"), 1), (Some("down"), 2), (Some("down"), 3)];
     let back = [(Some("down"), 4), (Some("up"), 3), (Some("up"), 2), (Some("up"), 1)];
     for (key, n) in steps.into_iter().chain(back) {
@@ -2350,10 +2434,10 @@ async fn a_choice_offers_the_copy_as_it_is_and_a_fork_per_head(
     assert_eq!(state.chooser.as_ref().expect("the chooser opens").selected, selected);
 
     let out = text(&render(&mut state, &s, 100, 30));
-    assert!(out.contains("1 CC Claude Code  this copy as is"), "{out}");
-    let newest = "2 CC Claude Code  fork this machine's · +2 since they split · 55m ago";
+    assert!(out.contains("1 Claude Code  this copy as is"), "{out}");
+    let newest = "2 Claude Code  fork this machine's · +2 since they split · 55m ago";
     assert!(out.contains(newest), "{out}");
-    let older = "3 CC Claude Code  fork @00000002's · 57m ago";
+    let older = "3 Claude Code  fork @00000002's · 57m ago";
     assert!(out.contains(older), "{out}");
 
     // The copy as it is.
@@ -2435,12 +2519,11 @@ async fn a_choice_offers_to_switch_the_copy_to_another_branch() {
     assert_eq!(state.chooser.as_ref().expect("the chooser opens").selected, 0, "as is");
 
     let out = text(&render(&mut state, &s, 100, 30));
-    assert!(out.contains("> 1 CC Claude Code  this copy as is"), "{out}");
-    let switch =
-        "2 CC Claude Code  switch to @00000002's · replaces this copy, yours stays in atuin";
+    assert!(out.contains("> 1 Claude Code  this copy as is"), "{out}");
+    let switch = "2 Claude Code  switch to @00000002's · replaces this copy, yours stays in atuin";
     assert!(out.contains(switch), "{out}");
-    assert!(out.contains("3 CC Claude Code  fork this machine's"), "{out}");
-    assert!(out.contains("4 CC Claude Code  fork @00000002's"), "{out}");
+    assert!(out.contains("3 Claude Code  fork this machine's"), "{out}");
+    assert!(out.contains("4 Claude Code  fork @00000002's"), "{out}");
     assert!(!out.contains("5 CC"), "one switch line per head it can be switched to: {out}");
 
     let InputAction::Pick(picked) = press(&mut state, &s, "2") else {

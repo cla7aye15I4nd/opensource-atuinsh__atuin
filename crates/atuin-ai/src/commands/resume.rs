@@ -58,7 +58,7 @@ use crate::resume_tui::resumer::{HarnessResumer, NotResumable, Resume, quote, sh
 use crate::resume_tui::sidecar::SidecarSource;
 use crate::resume_tui::source::{Relation, harness_label};
 use crate::resume_tui::{
-    Outcome, Picker, ResumeContext, ResumePlan, Resumer, SessionRow, SessionSource,
+    Outcome, Picker, ResumeContext, ResumePlan, Resumer, SessionRow, SessionSource, startup,
 };
 
 const ACCEPT_PREFIX: &str = "__atuin_accept__:";
@@ -117,7 +117,7 @@ pub struct Cmd {
     #[arg(long, value_name = "BRANCH", conflicts_with_all = ["continue_in", "as_is"])]
     branch: Option<String>,
 
-    /// The filter the picker opens in (default: workspace, widening to global).
+    /// The filter the picker opens in (default: global).
     #[arg(long, value_enum)]
     filter_mode: Option<AiSessionFilterMode>,
 
@@ -378,6 +378,7 @@ async fn direct_target(
 }
 
 pub async fn run(cmd: Cmd, settings: &Settings) -> Result<()> {
+    startup("started");
     let mut settings = settings.clone();
     if let Some(mode) = cmd.filter_mode {
         settings.ai.sessions.filter_mode = Some(mode);
@@ -389,8 +390,10 @@ pub async fn run(cmd: Cmd, settings: &Settings) -> Result<()> {
     let query = cmd.query();
 
     let context = ResumeContext::current().await?;
+    startup("context read");
     let path = Settings::ai_session_sidecar_path();
     let source: Arc<dyn SessionSource> = Arc::new(SidecarSource::open(&path, &context).await?);
+    startup("session database open");
     let resumer: Arc<dyn Resumer> =
         Arc::new(HarnessResumer::new(context.clone(), settings.ai.sessions.resume.clone()));
 
@@ -454,6 +457,7 @@ pub async fn run(cmd: Cmd, settings: &Settings) -> Result<()> {
         }
     }
 
+    startup("query checked");
     let mut themes = ThemeManager::new(settings.theme.debug, None);
     let theme = themes.load_theme(settings.theme.name.as_str(), settings.theme.max_depth);
     let (outcome, note) = Picker {
@@ -1016,7 +1020,7 @@ mod tests {
             continue_plan(&source, &resumer, "7f3c9a12", ContinueIn::Codex).await.unwrap();
         assert_eq!(plan.program, "codex");
         assert_eq!(plan.args, ["resume", "continued-7f3c9a12-5be0-4d7e-9c41-0a8e2b6f4d10"]);
-        assert_eq!(status, "continuing in Codex: 42 tool calls become notes, reasoning dropped");
+        assert_eq!(status, "continuing in Codex: 42 tool calls become notes");
 
         let err = continue_plan(&source, &resumer, "fix flaky", ContinueIn::Pi).await.unwrap_err();
         assert!(err.to_string().contains("no single session has the id"), "{err}");

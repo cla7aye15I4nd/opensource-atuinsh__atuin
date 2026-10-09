@@ -116,6 +116,62 @@ pub struct SessionPreview {
     pub last_assistant: Option<String>,
 }
 
+/// One piece of a session's conversation, as the reader shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TranscriptEntry {
+    /// What the user asked.
+    Prompt(String),
+    /// What the agent answered.
+    Reply(String),
+    /// A model-written summary standing in for earlier conversation.
+    Summary(String),
+    /// The tools the agent called between two pieces of text: each name, and how many times in a
+    /// row.
+    Tools(Vec<(String, usize)>),
+}
+
+/// Builds a session's [`TranscriptEntry`]s from its messages in order, folding each run of tool
+/// calls into one entry.
+#[derive(Default)]
+pub struct TranscriptBuilder {
+    entries: Vec<TranscriptEntry>,
+}
+
+impl TranscriptBuilder {
+    pub fn prompt(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.entries.push(TranscriptEntry::Prompt(text.to_owned()));
+        }
+    }
+
+    pub fn reply(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.entries.push(TranscriptEntry::Reply(text.to_owned()));
+        }
+    }
+
+    pub fn summary(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.entries.push(TranscriptEntry::Summary(text.to_owned()));
+        }
+    }
+
+    pub fn tool(&mut self, name: &str) {
+        if let Some(TranscriptEntry::Tools(tools)) = self.entries.last_mut() {
+            match tools.last_mut() {
+                Some((last, n)) if last == name => *n += 1,
+                _ => tools.push((name.to_owned(), 1)),
+            }
+        } else {
+            self.entries.push(TranscriptEntry::Tools(vec![(name.to_owned(), 1)]));
+        }
+    }
+
+    pub fn finish(self) -> Vec<TranscriptEntry> {
+        self.entries
+    }
+}
+
 /// Where the picker's sessions come from.
 #[async_trait]
 pub trait SessionSource: Send + Sync {
@@ -134,6 +190,12 @@ pub trait SessionSource: Send + Sync {
     /// The forks grouped under a root, newest first: the [listed](Relation::is_listed) sessions
     /// among its children, never its subagents.
     async fn children(&self, session: &HarnessSession) -> eyre::Result<Vec<SessionRow>>;
+
+    /// The session's whole conversation, oldest first, for the reader. Reasoning and tool
+    /// results never appear; tool calls are folded into [`TranscriptEntry::Tools`].
+    async fn transcript(&self, _session: &HarnessSession) -> eyre::Result<Vec<TranscriptEntry>> {
+        Ok(Vec::new())
+    }
 
     /// Session `session` with every message it holds, as its harness can write it back out to be
     /// resumed in `cwd` (see [`super::resumer::Resumer::restore`]).

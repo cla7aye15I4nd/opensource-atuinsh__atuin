@@ -7,14 +7,17 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use atuin_client::ai_session::{AiSessionDatabase, Analysis, HarnessSession, SearchTerms, Session};
 use atuin_common::harnesstools::rehydrate::RehydrateSession;
-use atuin_common::harnesstools::session::{Content, ParentKind};
+use atuin_common::harnesstools::session::{Content, ParentKind, Role};
 use atuin_common::string::highlighted::HighlightedString;
 use atuin_common::utils::in_git_repo;
 use eyre::{Result, WrapErr};
 use futures::TryStreamExt;
 use parking_lot::Mutex;
 
-use super::source::{Relation, SessionFilter, SessionPreview, SessionRow, SessionSource, Snippet};
+use super::source::{
+    Relation, SessionFilter, SessionPreview, SessionRow, SessionSource, Snippet, TranscriptBuilder,
+    TranscriptEntry,
+};
 use super::{ResumeContext, title};
 
 pub struct SidecarSource {
@@ -161,6 +164,23 @@ impl SessionSource for SidecarSource {
             first_prompt: parts.first_user.as_deref().and_then(text_of),
             last_assistant: parts.last_assistant.as_deref().and_then(text_of),
         })
+    }
+
+    async fn transcript(&self, session: &HarnessSession) -> Result<Vec<TranscriptEntry>> {
+        let mut transcript = TranscriptBuilder::default();
+        let mut messages = std::pin::pin!(self.db.messages(session));
+        while let Some(m) = messages.try_next().await? {
+            for c in &m.content {
+                match (&m.role, c) {
+                    (_, Content::Summary(t)) => transcript.summary(t),
+                    (Role::User, Content::Text(t)) => transcript.prompt(t),
+                    (Role::Assistant, Content::Text(t)) => transcript.reply(t),
+                    (Role::Assistant, Content::ToolUse(call)) => transcript.tool(&call.name),
+                    _ => {}
+                }
+            }
+        }
+        Ok(transcript.finish())
     }
 
     async fn children(&self, session: &HarnessSession) -> Result<Vec<SessionRow>> {

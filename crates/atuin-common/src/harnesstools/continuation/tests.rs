@@ -562,7 +562,7 @@ fn calls_become_notes_and_turns_merge() {
         tool_results: 3,
         reasoning: 1
     });
-    assert_eq!(c.flattened.summary(), "2 tool calls become notes, reasoning dropped");
+    assert_eq!(c.flattened.summary(), "2 tool calls become notes");
     let turns: Vec<(Role, String)> = c.session.messages[1..]
         .iter()
         .map(|m| match m.content.as_slice() {
@@ -733,7 +733,8 @@ fn rows_chain_where_the_target_keeps_a_tree(#[case] target: AnyHarness, #[case] 
 }
 
 #[rstest]
-#[case(Flattened { tool_calls: 42, tool_results: 42, reasoning: 3 }, "42 tool calls become notes, reasoning dropped")]
+#[case(Flattened { tool_calls: 42, tool_results: 42, reasoning: 3 }, "42 tool calls become notes")]
+#[case(Flattened { tool_calls: 0, tool_results: 0, reasoning: 3 }, "")]
 #[case(Flattened { tool_calls: 1, tool_results: 1, reasoning: 0 }, "1 tool call becomes a note")]
 #[case(Flattened { tool_calls: 0, tool_results: 2, reasoning: 0 }, "tool output dropped")]
 #[case(Flattened::default(), "")]

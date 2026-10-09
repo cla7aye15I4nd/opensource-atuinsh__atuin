@@ -116,8 +116,9 @@ pub struct Flattened {
 }
 
 impl Flattened {
-    /// What was left out, for a status line: `42 tool calls become notes, reasoning
-    /// dropped`. Empty when nothing was.
+    /// What changes for the agent continuing it, for a status line: `42 tool calls become
+    /// notes`. Empty when nothing does. Reasoning isn't mentioned: no agent can use another's,
+    /// and the picker never shows it.
     #[must_use]
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
@@ -128,9 +129,6 @@ impl Flattened {
         }
         if self.tool_calls == 0 && self.tool_results > 0 {
             parts.push("tool output dropped".to_owned());
-        }
-        if self.reasoning > 0 {
-            parts.push("reasoning dropped".to_owned());
         }
         parts.join(", ")
     }
